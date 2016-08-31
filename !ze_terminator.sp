@@ -12,6 +12,7 @@
 #include <sdkhooks>
 #include <emitsoundany>
 #include <entWatch>
+#include <cg_ze>
 #include <zrterminator>
 
 #pragma newdecls required
@@ -20,10 +21,11 @@
 				Global Define
 				
 *******************************************************/
-#define PLUGIN_VERSION " 1.7 "
+#define PLUGIN_VERSION " 2.1 "
 #define PLUGIN_PREFIX "[\x0EPlaneptune\x01]  "
 
 #define sndBeacon "maoling/ze/beacon.mp3"
+#define sndBoom   "maoling/nuke/boom.mp3"
 #define BOMBRING "materials/sprites/bomb_planted_ring.vmt"
 #define HALO "materials/sprites/halo.vmt"
 
@@ -36,10 +38,11 @@ Handle g_fwdOnTerminatorExec;
 Handle g_fwdOnTerminatorDown;
 bool g_bIsTerminator[MAXPLAYERS+1];
 bool g_bHasTerminator;
-int g_bKillByT[MAXPLAYERS+1];
+bool g_bKillByT[MAXPLAYERS+1];
 int g_iTerminatorType[MAXPLAYERS+1];
 int g_iInfectHP[MAXPLAYERS+1];
 int g_iEdgeKnife[MAXPLAYERS+1];
+int g_iDamage;
 int g_iBombRing;
 int g_iHalo;
 int g_iToolsVelocity;
@@ -68,7 +71,7 @@ public void OnPluginStart()
 {
 	g_iToolsVelocity = FindSendPropInfo("CBasePlayer", "m_vecVelocity[0]");
 
-	RegAdminCmd("sm_sett", AdminSetTerminator, ADMFLAG_BAN);
+	RegAdminCmd("sm_tset", AdminSetTerminator, ADMFLAG_BAN);
 
 	HookEvent("player_death", Event_PlayerDeath);
 	HookEvent("player_spawn", Event_PlayerSpawn);
@@ -78,11 +81,20 @@ public void OnPluginStart()
 	g_fwdOnTerminatorDown = CreateGlobalForward("ZE_OnTerminatorDown", ET_Ignore, Param_Cell);
 }
 
+public void OnPluginEnd()
+{
+	for(int i = 1; i <= MaxClients; ++i)
+		if(IsClientInGame(i))
+			OnClientDisconnect(i);
+}
+
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
 {
 	CreateNative("ZE_IsClientTerminator", Native_IsClientTerminator);
 	CreateNative("ZE_GetTerminatorType", Native_GetTerminatorType);
-	
+
+	MarkNativeAsOptional("ZE_IsClientTakeEnt");
+
 	if(late)
 		for(int i = 1; i <= MaxClients; ++i)
 			if(IsClientInGame(i))
@@ -103,8 +115,10 @@ public int Native_GetTerminatorType(Handle plugin, int numParams)
 
 public void OnMapStart()
 {
+	PrecacheSoundAny(sndBoom);
 	PrecacheSoundAny(sndBeacon);
 	AddFileToDownloadsTable("sound/maoling/ze/beacon.mp3");
+	AddFileToDownloadsTable("sound/maoling/nuke/boom.mp3");
 
 	g_iBombRing = PrecacheModel(BOMBRING);
 	g_iHalo = PrecacheModel(HALO);
@@ -117,11 +131,16 @@ public void OnMapStart()
 *******************************************************/
 public void OnClientPostAdminCheck(int client)
 {
-	g_bKillByT[client] = 0;
+	g_bKillByT[client] = false;
 	g_bIsTerminator[client] = false;
 	g_iTerminatorType[client] = 0;
 	g_iInfectHP[client] = 0;
 	SDKHook(client, SDKHook_OnTakeDamage, OnTakeDamage);
+}
+
+public void OnClientDisconnect(int client)
+{
+	SDKUnhook(client, SDKHook_OnTakeDamage, OnTakeDamage);
 }
 
 public Action Event_PlayerSpawn(Handle event, const char[] name, bool dontBroadcast)
@@ -136,8 +155,8 @@ public Action Event_PlayerSpawn(Handle event, const char[] name, bool dontBroadc
 	
 	if(!ZR_IsClientHuman(client))
 		return;
-
-	g_bKillByT[client] = 0;
+	
+	g_bKillByT[client] = false;
 	g_iTerminatorType[client] = 0;
 	g_iInfectHP[client] = 0;
 	g_iEdgeKnife[client] = 0;
@@ -156,19 +175,12 @@ public Action Event_PlayerDeath(Handle event, const char[] name, bool dontBroadc
 	
 	if(client == attacker || !client || !attacker || !g_bIsTerminator[attacker])
 		return;
-	
-	if(!IsClientInGame(attacker) || !IsClientInGame(client))
-		return;
-	
-	if(!IsPlayerAlive(attacker) || !ZR_IsClientHuman(attacker))
-		return;
-	
-	g_bKillByT[client]++;
+
+	g_bKillByT[client] = true;
 }
 
 public Action Event_RoundEnd(Handle event, const char[] name, bool dontBroadcast)
 {
-	//Reset Terminator
 	if(g_bHasTerminator)
 	{
 		g_bHasTerminator = false;
@@ -176,7 +188,7 @@ public Action Event_RoundEnd(Handle event, const char[] name, bool dontBroadcast
 		{
 			if(IsClientInGame(client))
 			{
-				g_bKillByT[client] = 0;
+				g_bKillByT[client] = false;
 				if(g_bIsTerminator[client])
 				{
 					g_bIsTerminator[client] = false;
@@ -201,12 +213,13 @@ public Action Event_RoundEnd(Handle event, const char[] name, bool dontBroadcast
 				}
 			}
 		}
+		//LogToFileEx(logFile, "Round End ResetAll");
 	}
 }
 
 /*******************************************************
 
-				ZombieReloaded Forward
+				ZombieReloaded APIs
 				
 *******************************************************/
 public Action ZR_OnClientInfect(int &client, int &attacker, bool &motherInfect, bool &respawnOverride, bool &respawn)
@@ -215,15 +228,18 @@ public Action ZR_OnClientInfect(int &client, int &attacker, bool &motherInfect, 
 		return Plugin_Continue;
 
 	if(g_bHasTerminator)
+	{
 		if(g_bIsTerminator[client])
+		{	
 			return Plugin_Handled;
+		}
+	}
 
 	return Plugin_Continue;
 }
 
 public int ZR_OnClientInfected(int client, int attacker, bool motherInfect, bool respawnOverride, bool respawn)
 {
-	//Fixing arm bug
 	if(IsClientInGame(client))
 	{
 		if(IsPlayerAlive(client))
@@ -237,6 +253,7 @@ public int ZR_OnClientInfected(int client, int attacker, bool motherInfect, bool
 					RemovePlayerItem(client, weapon_index);
 					RemoveEdict(weapon_index);
 				}
+
 				GivePlayerItem(client, "weapon_knife");
 			}
 		}
@@ -244,30 +261,21 @@ public int ZR_OnClientInfected(int client, int attacker, bool motherInfect, bool
 
 	if(!g_bHasTerminator)
 	{
-		int Humans = 0;
-		int Zombie = 0;
+		int Humanos = 0;
+		int Zombieos = 0;
 		for(int i=1; i <= MaxClients; i++)
 		{
 			if (IsClientInGame(i) && IsPlayerAlive(i) && ZR_IsClientHuman(i))
-				Humans++;
+				Humanos++;
 				
 			if (IsClientInGame(i) && IsPlayerAlive(i) && ZR_IsClientZombie(i))
-				Zombie++;
+				Zombieos++;
 		}
-
-		int total = Zombie + Humans;
+		
+		if(!Humanos)
+			return;
 			
-		if (total<= 10 && Humans==1)
-			PrintToChatAll("%s \x07人数不足10人,终结者变身失败!", PLUGIN_PREFIX);
-		else if(10<total<= 20 && Humans == 1)
-			SetTerminator();
-		else if(20<total<=30 && Humans == 2)
-			SetTerminator();
-		else if(30<total<=40 && Humans == 3)
-			SetTerminator();
-		else if(40<total<=50 && Humans == 4)
-			SetTerminator();
-		else if(total>50 && Humans == 6)
+		if(((Zombieos+Humanos)/Humanos) >= 7)
 			SetTerminator();
 	}
 }
@@ -277,11 +285,15 @@ public Action ZR_OnClientRespawn(int &client, ZR_RespawnCondition &condition)
 	if(!g_bHasTerminator)
 		return Plugin_Continue;
 
-	if(g_bKillByT[client] >= 3)
+	if(g_bKillByT[client])
+	{
 		return Plugin_Handled;
-
+	}
+	
 	if(g_bIsTerminator[client])
+	{
 		return Plugin_Handled;
+	}
 
 	return Plugin_Continue;
 }
@@ -292,7 +304,7 @@ public Action ZR_OnClientRespawn(int &client, ZR_RespawnCondition &condition)
 				
 *******************************************************/
 public Action OnTakeDamage(int victim, int &attacker, int &inflictor, float &damage, int &damagetype, int &weapon, float damageForce[3], float damagePosition[3])
-{	
+{
 	if(!g_bHasTerminator)
 		return Plugin_Continue;
 
@@ -301,87 +313,84 @@ public Action OnTakeDamage(int victim, int &attacker, int &inflictor, float &dam
 	
 	if(!IsValidEdict(weapon))
 		return Plugin_Continue;
-
+	
+	if(g_iInfectHP[victim] <= -100)
+		return Plugin_Continue;
+		
 	if(IsPlayerAlive(attacker) && ZR_IsClientZombie(attacker) && g_bIsTerminator[victim])
-	{	
+	{
 		g_iInfectHP[victim]--;
 		
 		PrintHintText(victim, "<font size='40' color='#00FF00'>剩余HP: <strong>%d</strong>点HP</font>", g_iInfectHP[victim]);
 		PrintToChat(victim, "%s  受到攻击来源\x07%N\x01的1点伤害,剩余HP:\x07 %d", PLUGIN_PREFIX, attacker, g_iInfectHP[victim]);
 		
-		if(g_iInfectHP[victim] <= 0)
+		if(-100 < g_iInfectHP[victim] <= 0)
 		{
-			damagetype = DMG_SHOCK;
-			damage = 99999.0;
-			OnTerminatorDown(victim);
-			return Plugin_Changed;
+			g_iInfectHP[victim] = -999;
+			KillTerminator(victim);
+			return Plugin_Handled;
 		}
 		
-		CreateTimer(0.0, Timer_SetHealth, victim);
-
-		return Plugin_Handled;
+		damage = 0.0;
+		damagetype = DMG_SHOCK;
+		return Plugin_Changed;
 	}
 
 	if(g_bIsTerminator[attacker])
 	{
 		char clsname[32];
-		GetEdictClassname(weapon, clsname, 32);	
-		
+		GetEdictClassname(weapon, clsname, sizeof(clsname));		
 		if(StrContains(clsname, "deagle", false ) != -1)
 		{
 			damage *= 6;
-	
 			if(damage >= 800)
 				damage = 800.0;
-	
+			
 			if(g_iTerminatorType[attacker] == 2)
 				damage *= 0.250000;
 		}
 		else if(StrContains(clsname, "knife", false ) != -1)
 		{
-			if(damage >= 165.0)
-				damage *= 100.0;
-			else if(65.0 >= damage >= 45.0)
-				damage *= 80.0;
-			else
-				damage = 3000.00;
-
+			damage *= 50.0;
+			
 			if(g_iTerminatorType[attacker] == 2)
 			{
-				damage *= 0.250000;
-	
 				if(IsPlayerAlive(victim) && ZR_IsClientZombie(victim))
-					g_iInfectHP[attacker]++;
+					if(g_iInfectHP[attacker] < 8)
+						g_iInfectHP[attacker]++;
 				
 				if(damage >= 1.0 && IsClientInGame(attacker) && IsPlayerAlive(attacker) && IsClientInGame(victim) && IsPlayerAlive(victim) && ZR_IsClientHuman(attacker) && ZR_IsClientZombie(victim))
 					DoTerminatorKnockBack(attacker, victim, damage);
 			}
 			
-			//Fucking camp
+			//某些终结者蹲墙角
 			float loc[3];
+			
 			GetClientAbsOrigin(attacker, loc);
 			
 			float Distance = GetVectorDistance(g_fAttackLoc[attacker], loc);
 			
-			GetClientAbsOrigin(attacker, g_fAttackLoc[attacker]);
-			
-			if(Distance < 35.0)
+			if(Distance < 20.0)
+			{
 				g_iEdgeKnife[attacker]++;
+			}
 			
 			if(g_iEdgeKnife[attacker] > 10)
 			{
-				ForcePlayerSuicide(attacker);
+				KillTerminator(attacker);
 				PrintToChatAll("%s  \x04%N\x01因为蹲墙角被天谴了", PLUGIN_PREFIX, attacker);
 			}
-			
-			return Plugin_Changed;
+
+			g_fAttackLoc[attacker][0] = loc[0];
+			g_fAttackLoc[attacker][1] = loc[1];
+			g_fAttackLoc[attacker][2] = loc[2];
 		}
 		else
 		{
 			damage *= 2.0;
-			damagetype = DMG_SHOCK;
-			return Plugin_Changed;
 		}
+				
+		return Plugin_Changed;
 	}
 
 	return Plugin_Continue;
@@ -402,7 +411,6 @@ void SetTerminator()
 			ExecTerminator(client, GetRandomInt(1,2));
 		}
 	}
-
 	PrintCenterTextAll("<font color='#0066CC' size='30'>终结者已经出现!");
 	g_bHasTerminator = true;
 	SetupBeacon();
@@ -412,10 +420,8 @@ void SetTerminator()
 void ExecTerminator(int client, int type)
 {
 	g_iTerminatorType[client] = type;
-
-	//prevent remove ent
-	int weapon_index = -1;
-	if(!ZE_IsClientTakeEnt(client))
+	int weapon_index=-1;
+	if(!IsClientTakeEnt(client))
 	{	
 		if(((weapon_index = GetPlayerWeaponSlot(client, 1)) != -1))
 		{	
@@ -423,7 +429,7 @@ void ExecTerminator(int client, int type)
 			RemoveEdict(weapon_index);
 			GivePlayerItem(client, "weapon_revolver");
 		}
-
+		
 		if(((weapon_index = GetPlayerWeaponSlot(client, 2)) != -1))
 		{
 			RemovePlayerItem(client, weapon_index);
@@ -444,7 +450,7 @@ void ExecTerminator(int client, int type)
 		PrintToChat(client,"%s \x0C你已获得终结者手雷补给", PLUGIN_PREFIX);
 
 		g_iInfectHP[client] = 10;
-		SetTerminatorHealth(client);
+		SetEntityHealth(client, 200);
 		PrintToChat(client,"%s \x0C你已成为终结者(Type-800)[\x02伤害\x07++++\x0C]|[\x02击退\x07++++\x0C]", PLUGIN_PREFIX);
 	}
 
@@ -457,55 +463,22 @@ void ExecTerminator(int client, int type)
 		PrintToChat(client,"%s \x0C你已获得终结者手雷补给", PLUGIN_PREFIX);
 
 		g_iInfectHP[client] = 20;
-		SetTerminatorHealth(client);
+		SetEntityHealth(client, 200);
 		PrintToChat(client,"%s \x0C你已成为终结者(Type-T)[\x02伤害\x07+\x0C]|[\x02移速\x07++\x0C]|[\x02重力\x07--\x0C]|[\x02吸血\x07++\x0C]", PLUGIN_PREFIX);
-		
-		
-		SetEntPropFloat(client, Prop_Send, "m_flLaggedMovementValue", 1.2);
-		SetEntityGravity(client, 0.88);
-
-		//should keep speed and gravity
-		CreateTimer(5.0, Timer_SetSpeed, client, TIMER_REPEAT);
 	}
 
 	OnTerminatorExec(client);
+	//LogToFileEx(logFile, "Exec Terminator sucessful - client[%N] type_%d", client, type);
 }
 
 public Action AdminSetTerminator(int client, int args)
 {
-	g_bHasTerminator = true;
 	g_bIsTerminator[client] = true;
 	ExecTerminator(client, GetRandomInt(1,2));
+	
+	g_bHasTerminator = true;
 	SetupBeacon();
-}
-
-public Action Timer_SetSpeed(Handle timer, int client)
-{
-	if(!IsClientInGame(client))
-		return Plugin_Stop;
-	
-	if(!IsPlayerAlive(client))
-		return Plugin_Stop;
-		
-	if(!g_bHasTerminator)
-	{
-		SetEntPropFloat(client, Prop_Send, "m_flLaggedMovementValue", 1.000000);
-		return Plugin_Stop;
-	}
-
-	if(!g_bIsTerminator[client])
-	{
-		SetEntPropFloat(client, Prop_Send, "m_flLaggedMovementValue", 1.000000);
-		return Plugin_Stop;
-	}
-	
-	float m_flLaggedMovementValue = GetEntPropFloat(client, Prop_Send, "m_flLaggedMovementValue");
-	if(m_flLaggedMovementValue < 1.2)
-		SetEntPropFloat(client, Prop_Send, "m_flLaggedMovementValue", 1.2);
-	
-	SetEntityGravity(client, 0.88);
-
-	return Plugin_Continue;
+	SetupCure();
 }
 
 public Action Timer_Beacon(Handle timer, any data)
@@ -581,11 +554,16 @@ void CureTerminator()
 		if(!g_bIsTerminator[i])
 			continue;
 
-		if(g_iInfectHP[i] < 20)
-			g_iInfectHP[i]++;
+		if(g_iInfectHP[i] >= 20)
+			continue;
 		
-		SetTerminatorHealth(i);
-		PrintCenterText(i, "<font size='40' color='#00FF00'>你恢复了<strong>1</strong>点HP</font>");
+		g_iInfectHP[i]++;
+		
+		int hp = GetClientHealth(i) + g_iDamage;
+		if(hp > 100)
+			hp = 100;
+		SetEntityHealth(i, hp);
+		PrintHintText(i, "<font size='40' color='#00FF00'>你恢复了<strong>1</strong>点HP</font>");
 		PrintToChat(i, "%s  你恢复了\x041\x01点HP,当前剩余HP:\x07 %d", PLUGIN_PREFIX, g_iInfectHP[i]);
 	}
 }
@@ -604,13 +582,11 @@ void OnTerminatorDown(int client)
 	Call_Finish();
 }
 
-//knockback from zombiereloaded
+//肖凯操你妈版本击退V1.0
 void DoTerminatorKnockBack(int attacker, int victim, float damage)
 {
 	float clientloc[3];
 	float attackerloc[3];
-	
-	//multiple
 	float knockback = 2.0;
 	
 	GetClientAbsOrigin(victim, clientloc);
@@ -675,13 +651,58 @@ stock void ToolsClientVelocity(int client, float vecVelocity[3], bool apply = tr
 	TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, vecVelocity);
 }
 
-stock void SetTerminatorHealth(int client)
+public void KillTerminator(int victim)
 {
-	if(IsClientInGame(client) && IsPlayerAlive(client))
-		SetEntityHealth(client, g_iInfectHP[client]*10);
+	if(!IsClientInGame(victim))
+		return;
+
+	if(!IsPlayerAlive(victim))
+		return;
+	
+	CreateTimer(1.0, Timer_Expload, GetClientUserId(victim));
 }
 
-public Action Timer_SetHealth(Handle timer, int client)
+public Action Timer_Expload(Handle timer, int userid)
 {
-	SetTerminatorHealth(client);
+	int victim = GetClientOfUserId(userid);
+	
+	if(!IsClientInGame(victim))
+		return;
+
+	if(!IsPlayerAlive(victim))
+		return;
+		
+	int iEnt = CreateEntityByName("env_explosion");
+	
+	if(iEnt != -1)
+	{
+		float fPos[3];
+		GetClientAbsOrigin(victim, fPos);
+		
+		SetEntProp(iEnt, Prop_Data, "m_spawnflags", 6146);
+		SetEntProp(iEnt, Prop_Data, "m_iMagnitude", 2000);
+		SetEntProp(iEnt, Prop_Data, "m_iRadiusOverride", 1000);
+		
+		DispatchSpawn(iEnt);
+		ActivateEntity(iEnt);
+		
+		TeleportEntity(iEnt, fPos, NULL_VECTOR, NULL_VECTOR);
+		SetEntPropEnt(iEnt, Prop_Send, "m_hOwnerEntity", victim);
+
+		AcceptEntityInput(iEnt, "Explode");
+		AcceptEntityInput(iEnt, "Kill");
+		EmitSoundToAllAny(sndBoom, victim);
+	}
+
+	OnTerminatorDown(victim);
+}
+
+stock bool IsClientTakeEnt(int client)
+{
+	if(GetFeatureStatus(FeatureType_Native, "ZE_IsClientTakeEnt") == FeatureStatus_Available)
+	{
+		return ZE_IsClientTakeEnt(client);
+	}
+	else
+		return false;
 }
