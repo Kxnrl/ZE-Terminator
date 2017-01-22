@@ -1,0 +1,1 @@
+native bool ZE_IsClientTakeEnt(int client);
